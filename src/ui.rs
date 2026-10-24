@@ -44,35 +44,38 @@ pub fn draw(frame: &mut Frame, app: &App, blocker: &Blocker) {
             .collect();
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), page);
     } else {
-        let lines = app
-            .viewport_lines()
-            .into_iter()
-            .map(|line| {
-                let mut spans = Vec::new();
-                for piece in line.pieces {
-                    if let Some(hint) = piece.hint {
-                        spans.push(Span::styled(
-                            format!("{hint} "),
-                            Style::default().add_modifier(Modifier::BOLD),
-                        ));
-                    }
-                    let mut style = match piece.style {
-                        StyleKind::Heading => Style::default().add_modifier(Modifier::BOLD),
-                        StyleKind::Link => Style::default().add_modifier(Modifier::UNDERLINED),
-                        StyleKind::Code => Style::default().add_modifier(Modifier::DIM),
-                        StyleKind::Text => Style::default(),
-                    };
-                    if piece.focused || line.current_match {
-                        style = style.add_modifier(Modifier::REVERSED);
-                    }
-                    spans.push(Span::styled(piece.text, style));
+        let mut lines = Vec::new();
+        for line in app.viewport_lines() {
+            let mut spans = Vec::new();
+            if line.cursor {
+                spans.push(Span::styled(
+                    "> ",
+                    Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED),
+                ));
+            }
+            for piece in line.pieces {
+                if let Some(hint) = piece.hint {
+                    spans.push(Span::styled(
+                        format!("{hint} "),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ));
                 }
-                if spans.is_empty() {
-                    spans.push(Span::raw(" "));
+                let mut style = match piece.style {
+                    StyleKind::Heading => Style::default().add_modifier(Modifier::BOLD),
+                    StyleKind::Link => Style::default().add_modifier(Modifier::UNDERLINED),
+                    StyleKind::Code => Style::default().add_modifier(Modifier::DIM),
+                    StyleKind::Text => Style::default(),
+                };
+                if line.cursor || line.current_match {
+                    style = style.add_modifier(Modifier::REVERSED);
                 }
-                Line::from(spans)
-            })
-            .collect::<Vec<_>>();
+                spans.push(Span::styled(piece.text, style));
+            }
+            if spans.is_empty() {
+                spans.push(Span::raw(" "));
+            }
+            lines.push(Line::from(spans));
+        }
         frame.render_widget(Paragraph::new(lines), page);
     }
 
@@ -103,5 +106,33 @@ mod tests {
             .collect();
         assert!(text.contains("1 new"), "{text}");
         assert!(text.contains("o open"), "{text}");
+    }
+
+    #[test]
+    fn focused_link_draws_a_cursor() {
+        let blocker = Blocker::from_rules("");
+        let mut app = App::new(80, std::env::temp_dir().join("tbw-draw-absent"));
+        app.finish(
+            0,
+            0,
+            Ok(crate::load::Fetched {
+                final_url: "https://example.com/".into(),
+                html: "<p><a href=\"/next\">next</a></p>".into(),
+                blocked: 0,
+            }),
+            &blocker,
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &app, &blocker)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("> "), "{text}");
+        assert!(text.contains("next"), "{text}");
+        assert!(app.status_line(false).contains("T new tab"));
     }
 }

@@ -150,6 +150,7 @@ pub async fn fetch(
     post: bool,
     body: Option<String>,
 ) -> Result<Fetched, String> {
+    let mut shown = url.to_string();
     let mut current = url.to_string();
     let mut source = if url::Url::parse(source).is_ok() {
         source.to_string()
@@ -158,6 +159,14 @@ pub async fn fetch(
     };
     let mut post = post;
     let mut body = body;
+    // shortcut: DuckDuckGo treats a compressed search as a bot, upgrade if a normal GET works again
+    let mut plain_encoding = false;
+    if !post && let Some((action, form)) = ddg_search_post(&current) {
+        current = action;
+        post = true;
+        body = Some(form);
+        plain_encoding = true;
+    }
     for _ in 0..MAX_HOPS {
         if blocker.blocked(&current, &source, "document") {
             return Err("blocked".into());
@@ -170,6 +179,10 @@ pub async fn fetch(
         request = request
             .header(USER_AGENT, UA)
             .header("accept", "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8");
+        if plain_encoding {
+            request = request.header("accept-encoding", "identity");
+            plain_encoding = false;
+        }
         if let Some(cookie) = jar.header_for(&current) {
             request = request.header(COOKIE, cookie);
         }
@@ -196,6 +209,7 @@ pub async fn fetch(
             }
             source = current;
             current = next;
+            shown = current.clone();
             continue;
         }
         if !status.is_success() {
@@ -207,12 +221,38 @@ pub async fn fetch(
             .map(str::to_string);
         let bytes = response.bytes().await.map_err(|err| err.to_string())?;
         return Ok(Fetched {
-            final_url: current,
+            final_url: shown,
             html: decode(&bytes, content_type.as_deref()),
             blocked: 0,
         });
     }
     Err("too many redirects".into())
+}
+
+/// A DuckDuckGo search URL becomes a POST to the lite or html form.
+pub fn ddg_search_post(url: &str) -> Option<(String, String)> {
+    let parsed = url::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    if host != "duckduckgo.com" && !host.ends_with(".duckduckgo.com") {
+        return None;
+    }
+    let query = parsed
+        .query_pairs()
+        .find(|(key, _)| key == "q")?
+        .1
+        .into_owned();
+    if query.is_empty() {
+        return None;
+    }
+    let action = if parsed.path().starts_with("/html") {
+        "https://html.duckduckgo.com/html/"
+    } else {
+        "https://lite.duckduckgo.com/lite/"
+    };
+    let body = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("q", &query)
+        .finish();
+    Some((action.to_string(), body))
 }
 
 fn join_url(base: &str, location: &str) -> Result<String, String> {
@@ -309,6 +349,19 @@ mod tests {
         let mut bytes = head.into_bytes();
         bytes.extend_from_slice(body);
         bytes
+    }
+
+    #[test]
+    fn duckduckgo_search_is_a_post() {
+        let (action, body) =
+            ddg_search_post("https://html.duckduckgo.com/html/?q=rust+docs").unwrap();
+        assert_eq!(action, "https://html.duckduckgo.com/html/");
+        assert_eq!(body, "q=rust+docs");
+        let (action, body) =
+            ddg_search_post("https://lite.duckduckgo.com/lite/?q=rust%20docs").unwrap();
+        assert_eq!(action, "https://lite.duckduckgo.com/lite/");
+        assert_eq!(body, "q=rust+docs");
+        assert!(ddg_search_post("https://example.org/?q=rust").is_none());
     }
 
     #[test]

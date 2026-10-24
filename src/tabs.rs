@@ -9,7 +9,7 @@ use crate::dom;
 use crate::layout::{self, Document, Focus};
 use crate::load::Fetched;
 
-pub const DEFAULT_SEARCH: &str = "https://html.duckduckgo.com/html/?q={q}";
+pub const DEFAULT_SEARCH: &str = "https://lite.duckduckgo.com/lite/?q={q}";
 
 #[derive(Clone, Debug)]
 pub enum Mode {
@@ -45,6 +45,7 @@ struct Tab {
     index: usize,
     body: Body,
     focus: Option<usize>,
+    cursor: u16,
     blocked: u32,
     hidden: u32,
     error: Option<String>,
@@ -126,6 +127,8 @@ impl App {
             }
             let max = rendered.document.lines.len().saturating_sub(self.view_rows) as u16;
             tab.history[tab.index].scroll = tab.history[tab.index].scroll.min(max);
+            let last = rendered.document.lines.len().saturating_sub(1) as u16;
+            tab.cursor = tab.cursor.min(last);
             tab.body = Body::Loaded {
                 html,
                 doc: rendered.document,
@@ -166,6 +169,7 @@ impl App {
         if slot.generation != generation {
             return;
         }
+        let mut reveal = false;
         match result {
             Ok(page) => {
                 let rendered = dom::render(&page.html, &page.final_url, self.width, blocker);
@@ -174,16 +178,18 @@ impl App {
                 slot.hidden = rendered.hidden;
                 slot.blocked = page.blocked;
                 slot.error = None;
-                slot.focus = None;
                 let max = rendered.document.lines.len().saturating_sub(self.view_rows) as u16;
                 slot.history[slot.index].url = page.final_url;
                 slot.history[slot.index].scroll = slot.history[slot.index].scroll.min(max);
+                let last = rendered.document.lines.len().saturating_sub(1) as u16;
+                slot.cursor = slot.history[slot.index].scroll.min(last);
                 slot.body = Body::Loaded {
                     html: page.html,
                     doc: rendered.document,
                 };
                 if tab == self.current {
                     self.message.clear();
+                    reveal = true;
                 }
             }
             Err(err) => {
@@ -194,6 +200,9 @@ impl App {
                 }
                 slot.error = Some(err);
             }
+        }
+        if reveal {
+            self.focus_on_cursor();
         }
     }
 
@@ -317,6 +326,25 @@ impl App {
         if !self.find_query.is_empty() {
             parts.push(format!("/{}", self.find_query));
         }
+        if let Body::Loaded { doc, .. } = &tab.body {
+            let on_link = tab
+                .focus
+                .and_then(|index| doc.focus.get(index))
+                .is_some_and(|item| matches!(item, Focus::Link { .. }));
+            if on_link {
+                parts.push("Enter follow  T new tab".into());
+            } else if tab
+                .focus
+                .is_some_and(|index| matches!(doc.focus.get(index), Some(Focus::Field { .. })))
+            {
+                parts.push("Enter edit".into());
+            } else if tab
+                .focus
+                .is_some_and(|index| matches!(doc.focus.get(index), Some(Focus::Submit { .. })))
+            {
+                parts.push("Enter submit".into());
+            }
+        }
         parts.push(format!("hidden {}", tab.hidden));
         if tab.blocked > 0 {
             parts.push(format!("blocked {}", tab.blocked));
@@ -331,7 +359,7 @@ impl App {
         };
         let labels = hint_labels(doc);
         let hinting = matches!(self.mode, Mode::Hint { .. });
-        let focus = tab.focus;
+        let cursor = tab.cursor as usize;
         let start = tab.history[tab.index].scroll as usize;
         let end = (start + self.view_rows).min(doc.lines.len());
         doc.lines[start..end]
@@ -363,12 +391,12 @@ impl App {
                             DrawnPiece {
                                 text: piece.text.clone(),
                                 style: piece.style,
-                                focused: focus == piece.focus && piece.focus.is_some(),
                                 hint: show.then_some(hint).flatten(),
                             }
                         })
                         .collect(),
                     current_match: self.find_at == Some(index),
+                    cursor: index == cursor,
                 }
             })
             .collect()
@@ -389,15 +417,17 @@ impl App {
             KeyCode::Char(ch @ '1'..='9') if key.modifiers.is_empty() => {
                 self.focus_tab((ch as u8 - b'1') as usize)
             }
-            KeyCode::Char('j') | KeyCode::Down => self.scroll_by(1),
-            KeyCode::Char('k') | KeyCode::Up => self.scroll_by(-1),
-            KeyCode::PageDown => self.scroll_by(self.view_rows as i32),
-            KeyCode::PageUp => self.scroll_by(-(self.view_rows as i32)),
+            KeyCode::Char('j') | KeyCode::Down => self.move_cursor(1),
+            KeyCode::Char('k') | KeyCode::Up => self.move_cursor(-1),
+            KeyCode::PageDown => self.move_cursor(self.view_rows as i32),
+            KeyCode::PageUp => self.move_cursor(-(self.view_rows as i32)),
             KeyCode::Char('g') => self.scroll_to(true),
             KeyCode::Char('G') => self.scroll_to(false),
             KeyCode::Tab => self.move_focus(1),
             KeyCode::BackTab => self.move_focus(-1),
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => self.activate(true),
             KeyCode::Enter => self.activate(false),
+            KeyCode::Char('T') => self.activate(true),
             KeyCode::Char('f') => self.mode = Mode::Hint { new_tab: false },
             KeyCode::Char('F') => self.mode = Mode::Hint { new_tab: true },
             KeyCode::Char('b') | KeyCode::Backspace => self.back(),
@@ -520,8 +550,9 @@ impl App {
         };
         self.find_at = Some(next);
         self.message.clear();
-        let index = self.tabs[self.current].index;
-        self.tabs[self.current].history[index].scroll = next as u16;
+        self.tabs[self.current].cursor = next as u16;
+        self.keep_cursor_visible();
+        self.focus_on_cursor();
     }
 
     fn match_lines(&self) -> Option<Vec<usize>> {
@@ -682,64 +713,79 @@ impl App {
     }
 
     fn move_focus(&mut self, delta: isize) {
+        let cursor = self.tabs[self.current].cursor as usize;
         let Some(doc) = self.tabs[self.current].document() else {
             return;
         };
-        if doc.focus.is_empty() {
+        let Some(line) = doc.lines.get(cursor) else {
+            return;
+        };
+        let mut ids = Vec::new();
+        for piece in &line.spans {
+            if let Some(focus) = piece.focus
+                && !ids.contains(&focus)
+            {
+                ids.push(focus);
+            }
+        }
+        if ids.is_empty() {
             return;
         }
-        let len = doc.focus.len() as isize;
-        let next = match self.tabs[self.current].focus {
-            Some(index) => (index as isize + delta).rem_euclid(len) as usize,
-            None if delta < 0 => doc.focus.len() - 1,
+        let next = match self.tabs[self.current]
+            .focus
+            .and_then(|focus| ids.iter().position(|id| *id == focus))
+        {
+            Some(index) => (index as isize + delta).rem_euclid(ids.len() as isize) as usize,
+            None if delta < 0 => ids.len() - 1,
             None => 0,
         };
-        self.tabs[self.current].focus = Some(next);
-        self.reveal_focus();
+        self.tabs[self.current].focus = Some(ids[next]);
     }
 
-    fn reveal_focus(&mut self) {
-        let Some(focus) = self.tabs[self.current].focus else {
-            return;
-        };
-        let Some(doc) = self.tabs[self.current].document() else {
-            return;
-        };
-        let Some(line) = doc
-            .lines
-            .iter()
-            .position(|line| line.spans.iter().any(|piece| piece.focus == Some(focus)))
-        else {
-            return;
-        };
-        let history_index = self.tabs[self.current].index;
-        let scroll = self.tabs[self.current].history[history_index].scroll as usize;
-        let view = self.view_rows.max(1);
-        let next = if line < scroll {
-            line
-        } else if line >= scroll + view {
-            line + 1 - view
-        } else {
-            scroll
-        };
-        let index = self.tabs[self.current].index;
-        self.tabs[self.current].history[index].scroll = next as u16;
-    }
-
-    fn scroll_by(&mut self, delta: i32) {
+    fn move_cursor(&mut self, delta: i32) {
         let lines = self.tabs[self.current].line_count();
-        let max = lines.saturating_sub(self.view_rows) as i32;
-        let index = self.tabs[self.current].index;
-        let next =
-            (self.tabs[self.current].history[index].scroll as i32 + delta).clamp(0, max) as u16;
-        self.tabs[self.current].history[index].scroll = next;
+        if lines == 0 {
+            return;
+        }
+        let next = (self.tabs[self.current].cursor as i32 + delta).clamp(0, (lines - 1) as i32);
+        self.tabs[self.current].cursor = next as u16;
+        self.keep_cursor_visible();
+        self.focus_on_cursor();
     }
 
     fn scroll_to(&mut self, top: bool) {
-        let lines = self.tabs[self.current].line_count() as u16;
-        let max = lines.saturating_sub(self.view_rows as u16);
+        let lines = self.tabs[self.current].line_count();
+        if lines == 0 {
+            return;
+        }
+        self.tabs[self.current].cursor = if top { 0 } else { (lines - 1) as u16 };
+        self.keep_cursor_visible();
+        self.focus_on_cursor();
+    }
+
+    fn keep_cursor_visible(&mut self) {
+        let cursor = self.tabs[self.current].cursor as usize;
+        let view = self.view_rows.max(1);
         let index = self.tabs[self.current].index;
-        self.tabs[self.current].history[index].scroll = if top { 0 } else { max };
+        let scroll = self.tabs[self.current].history[index].scroll as usize;
+        let next = if cursor < scroll {
+            cursor
+        } else if cursor >= scroll + view {
+            cursor + 1 - view
+        } else {
+            scroll
+        };
+        self.tabs[self.current].history[index].scroll = next as u16;
+    }
+
+    fn focus_on_cursor(&mut self) {
+        let cursor = self.tabs[self.current].cursor as usize;
+        let focus = self.tabs[self.current].document().and_then(|doc| {
+            doc.lines
+                .get(cursor)
+                .and_then(|line| line.spans.iter().find_map(|piece| piece.focus))
+        });
+        self.tabs[self.current].focus = focus;
     }
 
     fn push_history(&mut self, url: String) {
@@ -747,12 +793,14 @@ impl App {
         if tab.history[tab.index].url.is_empty() {
             tab.history[tab.index].url = url;
             tab.history[tab.index].scroll = 0;
+            tab.cursor = 0;
             tab.focus = None;
             return;
         }
         tab.history.truncate(tab.index + 1);
         tab.history.push(Entry { url, scroll: 0 });
         tab.index = tab.history.len() - 1;
+        tab.cursor = 0;
         tab.focus = None;
     }
 
@@ -803,6 +851,7 @@ impl Tab {
             index: 0,
             body: Body::Unloaded,
             focus: None,
+            cursor: 0,
             blocked: 0,
             hidden: 0,
             error: None,
@@ -865,12 +914,12 @@ impl Prompt {
 pub struct ViewportLine {
     pub pieces: Vec<DrawnPiece>,
     pub current_match: bool,
+    pub cursor: bool,
 }
 
 pub struct DrawnPiece {
     pub text: String,
     pub style: layout::StyleKind,
-    pub focused: bool,
     pub hint: Option<char>,
 }
 
@@ -944,10 +993,65 @@ mod tests {
             Some("https://example.org")
         );
         let search = destination("rust docs", template).unwrap();
+        assert!(search.contains("lite.duckduckgo.com"), "{search}");
         assert!(
             search.contains("rust+docs") || search.contains("rust%20docs"),
             "{search}"
         );
+    }
+
+    #[test]
+    fn t_opens_the_focused_link_in_a_new_tab() {
+        let blocker = crate::block::Blocker::from_rules("");
+        let mut app = blank();
+        app.finish(
+            0,
+            0,
+            Ok(crate::load::Fetched {
+                final_url: "https://example.com/".into(),
+                html: "<p><a href=\"/next\">next</a></p>".into(),
+                blocked: 0,
+            }),
+            &blocker,
+        );
+        app.on_key(key('T'));
+        assert_eq!(app.tab_count(), 2);
+        assert_eq!(app.current(), 1);
+        assert_eq!(app.jobs.last().unwrap().url, "https://example.com/next");
+    }
+
+    #[test]
+    fn enter_follows_the_link_on_the_cursor_line() {
+        let blocker = crate::block::Blocker::from_rules("");
+        let mut app = blank();
+        let mut html = String::new();
+        for n in 0..25 {
+            html.push_str(&format!("<p>line {n}</p>"));
+        }
+        html.push_str("<p><a href=\"/late\">late</a></p>");
+        app.finish(
+            0,
+            0,
+            Ok(crate::load::Fetched {
+                final_url: "https://example.com/".into(),
+                html,
+                blocked: 0,
+            }),
+            &blocker,
+        );
+        for _ in 0..40 {
+            if app.status_line(false).contains("Enter follow") {
+                break;
+            }
+            app.on_key(key('j'));
+        }
+        assert!(app.status_line(false).contains("Enter follow"));
+        let scroll = app.tabs[0].history[0].scroll;
+        assert!(scroll > 0, "{scroll}");
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.tabs[0].history[0].scroll, scroll);
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.jobs.last().unwrap().url, "https://example.com/late");
     }
 
     #[test]
@@ -1072,8 +1176,13 @@ mod tests {
             }),
             &blocker,
         );
-        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        if app.status_line(false).contains("Enter edit") {
+            app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        }
+        if !app.status_line(false).contains("Enter submit") {
+            app.on_key(key('j'));
+        }
+        assert!(app.status_line(false).contains("Enter submit"));
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.jobs.len(), 1);
         assert!(app.jobs[0].post, "{:?}", app.jobs[0].url);
