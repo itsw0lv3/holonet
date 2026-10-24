@@ -1,5 +1,5 @@
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use encoding_rs::Encoding;
 use reqwest::header::{CONTENT_TYPE, COOKIE, HeaderMap, LOCATION, SET_COOKIE, USER_AGENT};
@@ -7,8 +7,9 @@ use reqwest::{Client, StatusCode};
 
 use crate::block::Blocker;
 
-const UA: &str = "tbw/0.1";
+const UA: &str = "holonet/0.1";
 const MAX_HOPS: usize = 10;
+const MAX_BODY: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 struct StoredCookie {
@@ -37,11 +38,20 @@ impl CookieJar {
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
-    pub fn header_for(&self, url: &str) -> Option<String> {
+    pub fn header_for(&self, url: &str, source: &str, post: bool) -> Option<String> {
         let Ok(url) = url::Url::parse(url) else {
             return None;
         };
         let host = url.host_str()?.to_string();
+        if post {
+            let same = url::Url::parse(source)
+                .ok()
+                .and_then(|source| source.host_str().map(|h| h.eq_ignore_ascii_case(&host)))
+                .unwrap_or(false);
+            if !same {
+                return None;
+            }
+        }
         let https = url.scheme() == "https";
         let path = url.path();
         let mut pairs = Vec::new();
@@ -57,7 +67,7 @@ impl CookieJar {
                         .to_ascii_lowercase()
                         .ends_with(&format!(".{}", cookie.domain.to_ascii_lowercase()))
             };
-            if domain_ok && path.starts_with(&cookie.path) {
+            if domain_ok && path_match(path, &cookie.path) {
                 pairs.push(format!("{}={}", cookie.name, cookie.value));
             }
         }
@@ -73,19 +83,33 @@ impl CookieJar {
             let Ok(text) = value.to_str() else {
                 continue;
             };
-            if let Some(cookie) = parse_set_cookie(text, &url) {
-                jar.retain(|existing| {
-                    !(existing.name == cookie.name
-                        && existing.domain == cookie.domain
-                        && existing.path == cookie.path)
-                });
-                jar.push(cookie);
+            if let Some(change) = parse_set_cookie(text, &url) {
+                match change {
+                    CookieChange::Delete { name, domain, path } => {
+                        jar.retain(|existing| {
+                            !(existing.name == name && existing.domain == domain && existing.path == path)
+                        });
+                    }
+                    CookieChange::Set(cookie) => {
+                        jar.retain(|existing| {
+                            !(existing.name == cookie.name
+                                && existing.domain == cookie.domain
+                                && existing.path == cookie.path)
+                        });
+                        jar.push(cookie);
+                    }
+                }
             }
         }
     }
 }
 
-fn parse_set_cookie(header: &str, url: &url::Url) -> Option<StoredCookie> {
+enum CookieChange {
+    Set(StoredCookie),
+    Delete { name: String, domain: String, path: String },
+}
+
+fn parse_set_cookie(header: &str, url: &url::Url) -> Option<CookieChange> {
     let mut parts = header.split(';');
     let (name, value) = parts.next()?.split_once('=')?;
     let name = name.trim();
@@ -97,6 +121,8 @@ fn parse_set_cookie(header: &str, url: &url::Url) -> Option<StoredCookie> {
     let mut path = "/".to_string();
     let mut secure = false;
     let mut host_only = true;
+    let mut max_age: Option<i64> = None;
+    let mut expires: Option<String> = None;
     for attr in parts {
         let attr = attr.trim();
         let (key, raw) = attr
@@ -110,26 +136,114 @@ fn parse_set_cookie(header: &str, url: &url::Url) -> Option<StoredCookie> {
             path = raw.to_string();
         } else if key.eq_ignore_ascii_case("secure") {
             secure = true;
+        } else if key.eq_ignore_ascii_case("max-age") {
+            max_age = raw.parse().ok();
+        } else if key.eq_ignore_ascii_case("expires") && !raw.is_empty() {
+            expires = Some(raw.to_string());
         }
     }
     if domain.is_empty() {
-        domain = url.host_str()?.to_string();
+        domain = url.host_str()?.to_ascii_lowercase();
+    } else if !domain_allowed(url.host_str()?, &domain) {
+        return None;
+    } else {
+        domain = domain.to_ascii_lowercase();
     }
-    Some(StoredCookie {
+    let delete = match max_age {
+        Some(age) => age <= 0,
+        None => expires
+            .as_deref()
+            .and_then(http_date)
+            .is_some_and(|secs| secs <= now_secs()),
+    };
+    if delete {
+        return Some(CookieChange::Delete {
+            name: name.to_string(),
+            domain,
+            path,
+        });
+    }
+    Some(CookieChange::Set(StoredCookie {
         name: name.to_string(),
         value: value.trim().to_string(),
         domain,
         host_only,
         path,
         secure,
+    }))
+}
+
+// shortcut: a public suffix such as co.uk is still accepted, upgrade when a site sets Domain on a suffix
+fn domain_allowed(host: &str, domain: &str) -> bool {
+    if !domain.contains('.') {
+        return false;
+    }
+    let host = host.to_ascii_lowercase();
+    let domain = domain.to_ascii_lowercase();
+    host == domain || host.ends_with(&format!(".{domain}"))
+}
+
+fn path_match(request: &str, cookie: &str) -> bool {
+    request == cookie
+        || (cookie.ends_with('/') && request.starts_with(cookie))
+        || request.starts_with(&format!("{cookie}/"))
+}
+
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn http_date(value: &str) -> Option<i64> {
+    let rest = value
+        .split_once(',')
+        .map(|(_, rest)| rest.trim())
+        .unwrap_or(value.trim());
+    let mut parts = rest.split_whitespace();
+    let day: i64 = parts.next()?.parse().ok()?;
+    let month = month_num(parts.next()?)?;
+    let year: i64 = parts.next()?.parse().ok()?;
+    let mut clock = parts.next()?.split(':');
+    let hour: i64 = clock.next()?.parse().ok()?;
+    let minute: i64 = clock.next()?.parse().ok()?;
+    let second: i64 = clock.next()?.parse().ok()?;
+    Some(days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second)
+}
+
+fn month_num(name: &str) -> Option<i64> {
+    Some(match name {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
     })
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = (year - era * 400) as u64;
+    let month_prime = if month > 2 { month - 3 } else { month + 9 } as u64;
+    let doy = (153 * month_prime + 2) / 5 + day as u64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe as i64 - 719_468
 }
 
 #[derive(Debug)]
 pub struct Fetched {
     pub final_url: String,
     pub html: String,
-    pub blocked: u32,
 }
 
 pub fn client() -> Client {
@@ -183,7 +297,7 @@ pub async fn fetch(
             request = request.header("accept-encoding", "identity");
             plain_encoding = false;
         }
-        if let Some(cookie) = jar.header_for(&current) {
+        if let Some(cookie) = jar.header_for(&current, &source, post) {
             request = request.header(COOKIE, cookie);
         }
         if post && let Some(payload) = &body {
@@ -219,40 +333,59 @@ pub async fn fetch(
             .get(CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
-        let bytes = response.bytes().await.map_err(|err| err.to_string())?;
+        let bytes = read_body(response).await?;
         return Ok(Fetched {
             final_url: shown,
             html: decode(&bytes, content_type.as_deref()),
-            blocked: 0,
         });
     }
     Err("too many redirects".into())
 }
 
-/// A DuckDuckGo search URL becomes a POST to the lite or html form.
+/// A DuckDuckGo lite or html search URL becomes a POST. Other DuckDuckGo URLs are left alone.
 pub fn ddg_search_post(url: &str) -> Option<(String, String)> {
     let parsed = url::Url::parse(url).ok()?;
     let host = parsed.host_str()?;
     if host != "duckduckgo.com" && !host.ends_with(".duckduckgo.com") {
         return None;
     }
-    let query = parsed
-        .query_pairs()
-        .find(|(key, _)| key == "q")?
-        .1
-        .into_owned();
-    if query.is_empty() {
+    let path = parsed.path().trim_end_matches('/');
+    if path != "/lite" && path != "/html" {
         return None;
     }
-    let action = if parsed.path().starts_with("/html") {
+    let pairs: Vec<(String, String)> = parsed
+        .query_pairs()
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    if !pairs.iter().any(|(key, value)| key == "q" && !value.is_empty()) {
+        return None;
+    }
+    let action = if path == "/html" {
         "https://html.duckduckgo.com/html/"
     } else {
         "https://lite.duckduckgo.com/lite/"
     };
-    let body = url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("q", &query)
-        .finish();
-    Some((action.to_string(), body))
+    let mut body = url::form_urlencoded::Serializer::new(String::new());
+    for (key, value) in &pairs {
+        body.append_pair(key, value);
+    }
+    Some((action.to_string(), body.finish()))
+}
+
+async fn read_body(mut response: reqwest::Response) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                if buf.len() + chunk.len() > MAX_BODY {
+                    return Err("page too large".into());
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            Ok(None) => return Ok(buf),
+            Err(err) => return Err(err.to_string()),
+        }
+    }
 }
 
 fn join_url(base: &str, location: &str) -> Result<String, String> {
@@ -275,7 +408,9 @@ pub fn decode(bytes: &[u8], content_type: Option<&str>) -> String {
 
 fn charset_from_header(content_type: &str) -> Option<&'static Encoding> {
     for part in content_type.split(';').skip(1) {
-        let (key, value) = part.split_once('=')?;
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
         if key.trim().eq_ignore_ascii_case("charset") {
             let label = value.trim().trim_matches('"');
             return Encoding::for_label(label.as_bytes());
@@ -361,12 +496,17 @@ mod tests {
             ddg_search_post("https://lite.duckduckgo.com/lite/?q=rust%20docs").unwrap();
         assert_eq!(action, "https://lite.duckduckgo.com/lite/");
         assert_eq!(body, "q=rust+docs");
+        let (_, body) = ddg_search_post("https://lite.duckduckgo.com/lite/?q=rust&s=10").unwrap();
+        assert_eq!(body, "q=rust&s=10");
+        assert!(ddg_search_post("https://duckduckgo.com/about?q=1").is_none());
         assert!(ddg_search_post("https://example.org/?q=rust").is_none());
     }
 
     #[test]
     fn decodes_declared_charset() {
         let text = decode(&[0xE9], Some("text/html; charset=windows-1252"));
+        assert_eq!(text, "é");
+        let text = decode(&[0xE9], Some("text/html; charset=windows-1252; x"));
         assert_eq!(text, "é");
     }
 
@@ -454,5 +594,98 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err, "blocked");
+    }
+
+    fn jar_with(url: &str, cookie: &str) -> CookieJar {
+        let jar = CookieJar::new();
+        let mut headers = HeaderMap::new();
+        headers.append(
+            SET_COOKIE,
+            reqwest::header::HeaderValue::from_str(cookie).unwrap(),
+        );
+        jar.store_headers(url, &headers);
+        jar
+    }
+
+    #[test]
+    fn cookie_domain_path_and_logout() {
+        let planted = jar_with("https://evil.test/", "sid=1; Domain=example.com");
+        assert!(
+            planted
+                .header_for("https://example.com/", "https://example.com/", false)
+                .is_none()
+        );
+
+        let bare = jar_with("https://example.com/", "sid=1; Domain=com");
+        assert!(
+            bare.header_for("https://example.com/", "https://example.com/", false)
+                .is_none()
+        );
+
+        let jar = jar_with("https://example.com/docs/page", "sid=1; Path=/docs");
+        let sent = jar
+            .header_for("https://example.com/docs/a", "https://example.com/", false)
+            .unwrap();
+        assert!(sent.contains("sid=1"), "{sent}");
+        assert!(
+            jar.header_for(
+                "https://example.com/docs-private",
+                "https://example.com/",
+                false
+            )
+            .is_none()
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.append(
+            SET_COOKIE,
+            reqwest::header::HeaderValue::from_str("sid=; Max-Age=0; Path=/docs").unwrap(),
+        );
+        jar.store_headers("https://example.com/docs/page", &headers);
+        assert!(
+            jar.header_for("https://example.com/docs/a", "https://example.com/", false)
+                .is_none()
+        );
+
+        let expired = jar_with(
+            "https://example.com/",
+            "old=1; Expires=Thu, 01 Jan 1970 00:00:00 GMT",
+        );
+        assert!(
+            expired
+                .header_for("https://example.com/", "https://example.com/", false)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn post_from_another_site_sends_no_cookies() {
+        let jar = jar_with("https://bank.test/login", "sid=1");
+        assert!(
+            jar.header_for("https://bank.test/transfer", "https://evil.test/", true)
+                .is_none()
+        );
+        let sent = jar
+            .header_for("https://bank.test/transfer", "https://bank.test/", true)
+            .unwrap();
+        assert!(sent.contains("sid=1"), "{sent}");
+    }
+
+    #[tokio::test]
+    async fn stops_reading_a_page_past_the_cap() {
+        let body = vec![b'a'; MAX_BODY + 1];
+        let base = serve(1, move |_request| response(200, "OK", &[], &body));
+        let err = fetch(
+            &client(),
+            &Blocker::from_rules(""),
+            &CookieJar::new(),
+            &base,
+            &base,
+            false,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, "page too large");
     }
 }

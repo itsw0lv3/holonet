@@ -39,6 +39,7 @@ pub enum FieldKind {
     Text,
     Hidden,
     Submit,
+    Password,
 }
 
 #[derive(Clone, Debug)]
@@ -62,6 +63,7 @@ pub struct Document {
     pub focus: Vec<Focus>,
     pub forms: Vec<Form>,
     pub text_chars: usize,
+    pub anchors: Vec<(String, usize)>,
 }
 
 pub struct Submission {
@@ -98,6 +100,8 @@ pub fn layout(
         code: 0,
         current_form: None,
         ol: Vec::new(),
+        pending_ids: Vec::new(),
+        anchors: Vec::new(),
     };
     if let Ok(base_sel) = scraper::Selector::parse("base[href]")
         && let Some(base_el) = html.select(&base_sel).next()
@@ -116,6 +120,7 @@ pub fn layout(
             focus: ctx.focus,
             forms: ctx.forms,
             text_chars,
+            anchors: ctx.anchors,
         },
         ctx.hidden_count,
     )
@@ -123,45 +128,42 @@ pub fn layout(
 
 pub fn submission(doc: &Document, form_index: usize, submit: Option<usize>) -> Option<Submission> {
     let form = doc.forms.get(form_index)?;
-    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
-    for (index, field) in form.fields.iter().enumerate() {
+    let include = |index: usize, field: &Field| {
         if field.name.is_empty() {
-            continue;
+            return false;
         }
-        let include = match field.kind {
-            FieldKind::Text | FieldKind::Hidden => true,
+        match field.kind {
+            FieldKind::Text | FieldKind::Hidden | FieldKind::Password => true,
             FieldKind::Submit => submit == Some(index),
-        };
-        if include {
-            serializer.append_pair(&field.name, &field.value);
         }
-    }
-    let encoded = serializer.finish();
+    };
     if form.method_post {
-        Some(Submission {
+        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+        for (index, field) in form.fields.iter().enumerate() {
+            if include(index, field) {
+                serializer.append_pair(&field.name, &field.value);
+            }
+        }
+        return Some(Submission {
             url: form.action.clone(),
             post: true,
-            body: Some(encoded),
-        })
-    } else if encoded.is_empty() {
-        Some(Submission {
-            url: form.action.clone(),
-            post: false,
-            body: None,
-        })
-    } else if form.action.contains('?') {
-        Some(Submission {
-            url: format!("{}&{encoded}", form.action),
-            post: false,
-            body: None,
-        })
-    } else {
-        Some(Submission {
-            url: format!("{}?{encoded}", form.action),
-            post: false,
-            body: None,
-        })
+            body: Some(serializer.finish()),
+        });
     }
+    let mut url = Url::parse(&form.action).ok()?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        for (index, field) in form.fields.iter().enumerate() {
+            if include(index, field) {
+                pairs.append_pair(&field.name, &field.value);
+            }
+        }
+    }
+    Some(Submission {
+        url: url.to_string(),
+        post: false,
+        body: None,
+    })
 }
 
 struct Ctx<'a> {
@@ -183,6 +185,8 @@ struct Ctx<'a> {
     code: u32,
     current_form: Option<usize>,
     ol: Vec<u32>,
+    pending_ids: Vec<String>,
+    anchors: Vec<(String, usize)>,
 }
 
 impl Ctx<'_> {
@@ -192,8 +196,14 @@ impl Ctx<'_> {
             return;
         }
         let name = el.value().name();
+        if !matches!(name, "script" | "style" | "iframe" | "svg" | "template")
+            && let Some(id) = el.value().id()
+        {
+            self.pending_ids.push(id.to_string());
+        }
         match name {
-            "script" | "style" | "noscript" | "iframe" | "svg" | "template" => {}
+            "script" | "style" | "iframe" | "svg" | "template" => {}
+            "noscript" => self.walk_children(el),
             "head" => self.walk_children(el),
             "title" => {
                 if self.title.is_empty() {
@@ -387,7 +397,25 @@ impl Ctx<'_> {
                     value
                 },
             ),
-            "button" | "reset" | "checkbox" | "radio" | "file" => {}
+            "checkbox" | "radio" => {
+                if el.value().attr("checked").is_some() {
+                    let value = if value.is_empty() { "on".into() } else { value };
+                    self.add_field(name, value, FieldKind::Hidden);
+                }
+            }
+            "password" => {
+                let shown = if value.is_empty() {
+                    "password".into()
+                } else {
+                    "*".repeat(value.chars().count().min(32))
+                };
+                let field = self.add_field(name, value, FieldKind::Password);
+                let form = self.current_form.unwrap();
+                let index = self.focus.len();
+                self.focus.push(Focus::Field { form, field });
+                self.push_text(&format!("[{shown}]"), StyleKind::Text, Some(index));
+            }
+            "button" | "reset" | "file" => {}
             _ => {
                 let shown = if value.is_empty() {
                     name.clone()
@@ -619,6 +647,12 @@ impl Ctx<'_> {
         if text.is_empty() {
             return;
         }
+        if !self.pending_ids.is_empty() {
+            let line = self.lines.len();
+            for id in self.pending_ids.drain(..) {
+                self.anchors.push((id, line));
+            }
+        }
         self.text_chars += text.chars().filter(|ch| !ch.is_whitespace()).count();
         self.col += text.width();
         if let Some(last) = self.cur.last_mut()
@@ -742,6 +776,16 @@ mod tests {
         let text = document.lines.iter().map(line_text).collect::<String>();
         assert!(!text.contains("secret"));
         assert!(text.contains("cat"));
+        let with_fallback = doc("<noscript><p>fallback</p></noscript>", 40);
+        let fallback = with_fallback.lines.iter().map(line_text).collect::<String>();
+        assert!(fallback.contains("fallback"), "{fallback}");
+        let masked = doc(
+            "<input type=\"password\" name=\"p\" value=\"secret\">",
+            40,
+        );
+        let masked_text = masked.lines.iter().map(line_text).collect::<String>();
+        assert!(masked_text.contains("***"), "{masked_text}");
+        assert!(!masked_text.contains("secret"), "{masked_text}");
         assert!(text.contains("visible"));
         match &document.focus[0] {
             Focus::Link { url } => assert_eq!(url, "https://example.com/dir/pic.png"),
@@ -788,5 +832,20 @@ mod tests {
         assert!(post.post);
         assert_eq!(post.url, "https://example.com/login");
         assert_eq!(post.body.as_deref(), Some("t=1&user=a"));
+        let fragment = doc(
+            "<form action=\"/search#top\"><input name=\"q\" value=\"rust\"></form>",
+            80,
+        );
+        assert_eq!(
+            submission(&fragment, 0, None).unwrap().url,
+            "https://example.com/search?q=rust#top"
+        );
+        let checks = doc(
+            "<form action=\"/ok\"><input type=\"checkbox\" name=\"agree\" value=\"yes\" checked><input type=\"checkbox\" name=\"nope\" value=\"1\"></form>",
+            80,
+        );
+        let checked = submission(&checks, 0, None).unwrap().url;
+        assert!(checked.contains("agree=yes"), "{checked}");
+        assert!(!checked.contains("nope"), "{checked}");
     }
 }

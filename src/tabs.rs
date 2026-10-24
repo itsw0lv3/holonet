@@ -22,7 +22,7 @@ pub enum Mode {
 }
 
 pub struct Job {
-    pub tab: usize,
+    pub tab_id: u64,
     pub generation: u64,
     pub url: String,
     pub source: String,
@@ -32,7 +32,10 @@ pub struct Job {
 
 struct Entry {
     url: String,
+    source: String,
     scroll: u16,
+    post: bool,
+    body: Option<String>,
 }
 
 pub enum Body {
@@ -41,6 +44,7 @@ pub enum Body {
 }
 
 struct Tab {
+    id: u64,
     history: Vec<Entry>,
     index: usize,
     body: Body,
@@ -70,13 +74,15 @@ pub struct App {
     pub jobs: Vec<Job>,
     pub update: bool,
     pub overlay: Option<Overlay>,
+    pub overlay_scroll: u16,
+    next_id: u64,
 }
 
 impl App {
     pub fn new(width: usize, config_path: PathBuf) -> Self {
         let (ttl_minutes, search) = load_settings(&config_path);
         Self {
-            tabs: vec![Tab::blank()],
+            tabs: vec![Tab::blank(0)],
             current: 0,
             width: width.max(1),
             view_rows: 20,
@@ -91,6 +97,8 @@ impl App {
             jobs: Vec::new(),
             update: false,
             overlay: None,
+            overlay_scroll: 0,
+            next_id: 1,
         }
     }
 
@@ -158,15 +166,15 @@ impl App {
 
     pub fn finish(
         &mut self,
-        tab: usize,
+        tab_id: u64,
         generation: u64,
         result: Result<Fetched, String>,
         blocker: &Blocker,
     ) {
-        let Some(slot) = self.tabs.get(tab) else {
+        let Some(tab) = self.tabs.iter().position(|slot| slot.id == tab_id) else {
             return;
         };
-        if slot.generation != generation {
+        if self.tabs[tab].generation != generation {
             return;
         }
         let mut reveal = false;
@@ -176,11 +184,17 @@ impl App {
                 let slot = &mut self.tabs[tab];
                 slot.loading = false;
                 slot.hidden = rendered.hidden;
-                slot.blocked = page.blocked;
+                slot.blocked = 0;
                 slot.error = None;
                 let max = rendered.document.lines.len().saturating_sub(self.view_rows) as u16;
-                slot.history[slot.index].url = page.final_url;
-                slot.history[slot.index].scroll = slot.history[slot.index].scroll.min(max);
+                let entry = &mut slot.history[slot.index];
+                if entry.url != page.final_url {
+                    entry.post = false;
+                    entry.body = None;
+                    entry.source = page.final_url.clone();
+                }
+                entry.url = page.final_url;
+                entry.scroll = entry.scroll.min(max);
                 let last = rendered.document.lines.len().saturating_sub(1) as u16;
                 slot.cursor = slot.history[slot.index].scroll.min(last);
                 slot.body = Body::Loaded {
@@ -215,11 +229,19 @@ impl App {
             return;
         }
         if self.overlay.is_some() {
-            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
-                if key.code == KeyCode::Char('q') {
+            match key.code {
+                KeyCode::Esc => self.overlay = None,
+                KeyCode::Char('q') => {
                     self.quit = true;
+                    self.overlay = None;
                 }
-                self.overlay = None;
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.overlay_scroll = self.overlay_scroll.saturating_add(1);
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.overlay_scroll = self.overlay_scroll.saturating_sub(1);
+                }
+                _ => {}
             }
             return;
         }
@@ -273,11 +295,19 @@ impl App {
     }
 
     pub fn url_line(&self) -> String {
+        let mask_edit = self.editing_password();
         match &self.mode {
             Mode::Open(buffer) => format!("open {buffer}"),
             Mode::Command(buffer) => format!(":{buffer}"),
             Mode::Find(buffer) => format!("/{buffer}"),
-            Mode::Edit(buffer) => format!("edit {buffer}"),
+            Mode::Edit(buffer) => {
+                let shown = if mask_edit {
+                    "*".repeat(buffer.chars().count())
+                } else {
+                    buffer.clone()
+                };
+                format!("edit {shown}")
+            }
             Mode::Hint { new_tab } => {
                 if *new_tab {
                     "hint new tab".into()
@@ -405,7 +435,7 @@ impl App {
     fn normal_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('q') => self.quit = true,
-            KeyCode::Char('?') => self.overlay = Some(Overlay::Help),
+            KeyCode::Char('?') => self.open_overlay(Overlay::Help),
             KeyCode::Char('o') => self.mode = Mode::Open(String::new()),
             KeyCode::Char(':') => self.mode = Mode::Command(String::new()),
             KeyCode::Char('/') => self.mode = Mode::Find(self.find_query.clone()),
@@ -484,8 +514,11 @@ impl App {
     }
 
     fn follow(&mut self, url: String) {
+        if self.scroll_to_fragment(&url) {
+            return;
+        }
         let source = self.current_url();
-        self.push_history(url.clone());
+        self.push_history(url.clone(), source.clone(), false, None);
         let tab = self.current;
         self.begin(tab, url, source, false, None);
     }
@@ -505,15 +538,19 @@ impl App {
             }
             "ttl" => {
                 if let Some(minutes) = parts.next().and_then(|value| value.parse::<u64>().ok()) {
+                    let old = self.ttl_minutes;
                     self.ttl_minutes = minutes;
-                    self.save_settings();
-                    self.message = format!("tab_ttl={minutes}");
+                    if self.save_settings() {
+                        self.message = format!("tab_ttl={minutes}");
+                    } else {
+                        self.ttl_minutes = old;
+                    }
                 } else {
                     self.message = format!("tab_ttl={}", self.ttl_minutes);
                 }
             }
-            "help" => self.overlay = Some(Overlay::Help),
-            "lists" => self.overlay = Some(Overlay::Lists),
+            "help" => self.open_overlay(Overlay::Help),
+            "lists" => self.open_overlay(Overlay::Lists),
             "update" => self.update = true,
             "js" => self.message = "javascript rendering is not built".into(),
             other => self.message = format!("unknown command {other}"),
@@ -579,18 +616,24 @@ impl App {
         let Some(focus) = self.tabs[self.current].focus else {
             return;
         };
+        let width = self.width.saturating_sub(2);
         let Body::Loaded { doc, .. } = &mut self.tabs[self.current].body else {
             return;
         };
         let Some(Focus::Field { form, field }) = doc.focus.get(focus).cloned() else {
             return;
         };
+        let kind = doc.forms[form].fields[field].kind;
+        let name = doc.forms[form].fields[field].name.clone();
         doc.forms[form].fields[field].value = buffer.clone();
-        let shown = if buffer.is_empty() {
-            doc.forms[form].fields[field].name.clone()
+        let shown = if matches!(kind, layout::FieldKind::Password) {
+            "*".repeat(buffer.chars().count())
+        } else if buffer.is_empty() {
+            name
         } else {
             buffer
         };
+        let shown = clip_cols(&shown, width);
         for line in &mut doc.lines {
             for piece in &mut line.spans {
                 if piece.focus == Some(focus) {
@@ -627,15 +670,12 @@ impl App {
                     return;
                 };
                 let source = self.current_url();
-                self.push_history(submission.url.clone());
+                let url = submission.url;
+                let post = submission.post;
+                let body = submission.body;
+                self.push_history(url.clone(), source.clone(), post, body.clone());
                 let tab = self.current;
-                self.begin(
-                    tab,
-                    submission.url,
-                    source,
-                    submission.post,
-                    submission.body,
-                );
+                self.begin(tab, url, source, post, body);
             }
             _ => {}
         }
@@ -647,7 +687,8 @@ impl App {
 
     fn open_tab(&mut self, url: Option<String>) {
         let at = self.current + 1;
-        self.tabs.insert(at, Tab::blank());
+        let tab = self.alloc_tab();
+        self.tabs.insert(at, tab);
         self.focus_tab(at);
         if let Some(url) = url {
             self.follow(url);
@@ -656,7 +697,8 @@ impl App {
 
     fn close_tab(&mut self) {
         if self.tabs.len() == 1 {
-            self.tabs[0] = Tab::blank();
+            let tab = self.alloc_tab();
+            self.tabs[0] = tab;
             return;
         }
         self.tabs.remove(self.current);
@@ -684,20 +726,15 @@ impl App {
     }
 
     fn load_if_unloaded(&mut self, index: usize) {
-        let unloaded = matches!(self.tabs[index].body, Body::Unloaded);
-        let url = self.tabs[index].url();
-        if unloaded && !url.is_empty() && !self.tabs[index].loading {
-            self.begin(index, url.clone(), url, false, None);
+        let tab = &self.tabs[index];
+        if matches!(tab.body, Body::Unloaded) && !tab.loading {
+            self.replay(index);
         }
     }
 
     fn reload(&mut self) {
-        let url = self.current_url();
-        if url.is_empty() {
-            return;
-        }
         let tab = self.current;
-        self.begin(tab, url.clone(), url, false, None);
+        self.replay(tab);
     }
 
     fn back(&mut self) {
@@ -706,12 +743,20 @@ impl App {
         }
         self.tabs[self.current].index -= 1;
         self.tabs[self.current].focus = None;
-        let url = self.tabs[self.current].url();
-        if url.is_empty() {
+        let tab = self.current;
+        self.replay(tab);
+    }
+
+    fn replay(&mut self, index: usize) {
+        let entry = &self.tabs[index].history[self.tabs[index].index];
+        if entry.url.is_empty() {
             return;
         }
-        let tab = self.current;
-        self.begin(tab, url.clone(), url, false, None);
+        let url = entry.url.clone();
+        let source = entry.source.clone();
+        let post = entry.post;
+        let body = entry.body.clone();
+        self.begin(index, url, source, post, body);
     }
 
     fn move_focus(&mut self, delta: isize) {
@@ -790,17 +835,27 @@ impl App {
         self.tabs[self.current].focus = focus;
     }
 
-    fn push_history(&mut self, url: String) {
+    fn push_history(&mut self, url: String, source: String, post: bool, body: Option<String>) {
         let tab = &mut self.tabs[self.current];
         if tab.history[tab.index].url.is_empty() {
-            tab.history[tab.index].url = url;
-            tab.history[tab.index].scroll = 0;
+            let entry = &mut tab.history[tab.index];
+            entry.url = url;
+            entry.source = source;
+            entry.post = post;
+            entry.body = body;
+            entry.scroll = 0;
             tab.cursor = 0;
             tab.focus = None;
             return;
         }
         tab.history.truncate(tab.index + 1);
-        tab.history.push(Entry { url, scroll: 0 });
+        tab.history.push(Entry {
+            url,
+            source,
+            scroll: 0,
+            post,
+            body,
+        });
         tab.index = tab.history.len() - 1;
         tab.cursor = 0;
         tab.focus = None;
@@ -812,14 +867,88 @@ impl App {
         slot.loading = true;
         slot.error = None;
         let generation = slot.generation;
+        let tab_id = slot.id;
         self.jobs.push(Job {
-            tab,
+            tab_id,
             generation,
             url,
             source,
             post,
             body,
         });
+    }
+
+    fn alloc_tab(&mut self) -> Tab {
+        let id = self.next_id;
+        self.next_id += 1;
+        Tab::blank(id)
+    }
+
+    fn open_overlay(&mut self, overlay: Overlay) {
+        self.overlay = Some(overlay);
+        self.overlay_scroll = 0;
+    }
+
+    fn editing_password(&self) -> bool {
+        let Mode::Edit(_) = &self.mode else {
+            return false;
+        };
+        let Some(focus) = self.tabs[self.current].focus else {
+            return false;
+        };
+        let Some(doc) = self.tabs[self.current].document() else {
+            return false;
+        };
+        let Some(Focus::Field { form, field }) = doc.focus.get(focus) else {
+            return false;
+        };
+        matches!(
+            doc.forms[*form].fields[*field].kind,
+            layout::FieldKind::Password
+        )
+    }
+
+    fn scroll_to_fragment(&mut self, url: &str) -> bool {
+        let Ok(next) = url::Url::parse(url) else {
+            return false;
+        };
+        let Some(frag) = next.fragment() else {
+            return false;
+        };
+        if frag.is_empty() {
+            return false;
+        }
+        let frag = frag.to_string();
+        let Ok(mut current) = url::Url::parse(&self.current_url()) else {
+            return false;
+        };
+        let mut next = next;
+        current.set_fragment(None);
+        next.set_fragment(None);
+        if current != next {
+            return false;
+        }
+        let Body::Loaded { doc, .. } = &self.tabs[self.current].body else {
+            return false;
+        };
+        let line = doc
+            .anchors
+            .iter()
+            .find(|(id, _)| id == &frag)
+            .map(|(_, line)| *line);
+        let Some(line) = line else {
+            self.message = "no such anchor".into();
+            return true;
+        };
+        let lines = self.tabs[self.current].line_count();
+        if lines == 0 {
+            return true;
+        }
+        self.tabs[self.current].cursor = line.min(lines - 1) as u16;
+        self.keep_cursor_visible();
+        self.focus_on_cursor();
+        self.message.clear();
+        true
     }
 
     fn hint_index(&self, ch: char) -> Option<usize> {
@@ -834,21 +963,32 @@ impl App {
         self.tabs[self.current].url()
     }
 
-    fn save_settings(&self) {
-        if let Some(parent) = self.config_path.parent() {
-            let _ = fs::create_dir_all(parent);
+    fn save_settings(&mut self) -> bool {
+        if let Some(parent) = self.config_path.parent()
+            && let Err(err) = fs::create_dir_all(parent)
+        {
+            self.message = format!("could not save settings: {err}");
+            return false;
         }
         let text = format!("tab_ttl={}\nsearch={}\n", self.ttl_minutes, self.search);
-        let _ = fs::write(&self.config_path, text);
+        if let Err(err) = fs::write(&self.config_path, text) {
+            self.message = format!("could not save settings: {err}");
+            return false;
+        }
+        true
     }
 }
 
 impl Tab {
-    fn blank() -> Self {
+    fn blank(id: u64) -> Self {
         Self {
+            id,
             history: vec![Entry {
                 url: String::new(),
+                source: String::new(),
                 scroll: 0,
+                post: false,
+                body: None,
             }],
             index: 0,
             body: Body::Unloaded,
@@ -880,6 +1020,20 @@ impl Tab {
 }
 
 // shortcut: hint letters cover the first 26 links, upgrade if a page needs labels past z
+fn clip_cols(text: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut width = 0;
+    for ch in text.chars() {
+        let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width > max {
+            break;
+        }
+        out.push(ch);
+        width += ch_width;
+    }
+    out
+}
+
 fn hint_labels(doc: &Document) -> Vec<(usize, char)> {
     let mut count = 0;
     let mut labels = Vec::new();
@@ -940,6 +1094,7 @@ pub fn help_lines() -> &'static [&'static str] {
         ":unload      drop this tab's page",
         ":unloadothers",
         ":ttl N       unload background tabs after N minutes (0 off)",
+        "j k          scroll this list",
         "q            quit",
         "Esc          close this",
     ]
@@ -999,7 +1154,7 @@ mod tests {
     }
 
     fn blank() -> App {
-        App::new(40, std::env::temp_dir().join("tbw-test-config-absent"))
+        App::new(40, std::env::temp_dir().join("holonet-test-config-absent"))
     }
 
     #[test]
@@ -1044,7 +1199,6 @@ mod tests {
             Ok(crate::load::Fetched {
                 final_url: "https://example.com/".into(),
                 html: "<p><a href=\"/next\">next</a></p>".into(),
-                blocked: 0,
             }),
             &blocker,
         );
@@ -1069,7 +1223,6 @@ mod tests {
             Ok(crate::load::Fetched {
                 final_url: "https://example.com/".into(),
                 html,
-                blocked: 0,
             }),
             &blocker,
         );
@@ -1143,7 +1296,6 @@ mod tests {
             Ok(crate::load::Fetched {
                 final_url: "https://one.test/".into(),
                 html: "<p>one</p>".into(),
-                blocked: 0,
             }),
             &crate::block::Blocker::from_rules(""),
         );
@@ -1172,7 +1324,6 @@ mod tests {
             Ok(crate::load::Fetched {
                 final_url: "https://example.com/".into(),
                 html: "<div id=\"app\"></div>".into(),
-                blocked: 0,
             }),
             &blocker,
         );
@@ -1184,7 +1335,6 @@ mod tests {
             Ok(crate::load::Fetched {
                 final_url: "https://example.com/".into(),
                 html: "<p>alpha beta</p><p>gamma</p>".into(),
-                blocked: 0,
             }),
             &blocker,
         );
@@ -1206,7 +1356,6 @@ mod tests {
             Ok(crate::load::Fetched {
                 final_url: "https://example.com/".into(),
                 html: "<form method=\"post\" action=\"/login\"><input name=\"user\" value=\"a\"><input type=\"submit\" value=\"go\"></form>".into(),
-                blocked: 0,
             }),
             &blocker,
         );
@@ -1233,7 +1382,6 @@ mod tests {
             Ok(crate::load::Fetched {
                 final_url: "https://example.com/".into(),
                 html: "<p><a href=\"/next\">next</a></p>".into(),
-                blocked: 0,
             }),
             &blocker,
         );
@@ -1275,5 +1423,166 @@ mod tests {
         let text = help_lines().join("\n");
         assert!(text.contains("Enter"));
         assert!(text.contains(":help"));
+    }
+
+    #[test]
+    fn load_survives_closing_the_tab_to_its_left() {
+        let blocker = crate::block::Blocker::from_rules("");
+        let mut app = blank();
+        app.on_key(key('t'));
+        app.on_key(key('t'));
+        app.on_key(key('1'));
+        app.on_key(key('W'));
+        app.on_key(key('2'));
+        assert_ne!(app.current(), app.tabs[app.current()].id as usize);
+        app.on_key(key('o'));
+        for ch in "https://two.test/".chars() {
+            app.on_key(key(ch));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let tab_id = app.jobs.last().unwrap().tab_id;
+        let generation = app.jobs.last().unwrap().generation;
+        assert_eq!(tab_id, 2);
+        app.on_key(key('1'));
+        app.on_key(key('W'));
+        assert_eq!(app.tab_count(), 1);
+        assert!(app.tabs[0].loading);
+        app.finish(
+            tab_id,
+            generation,
+            Ok(crate::load::Fetched {
+                final_url: "https://two.test/".into(),
+                html: "<p>landed</p>".into(),
+            }),
+            &blocker,
+        );
+        let text = app.tabs[0]
+            .document()
+            .map(|doc| doc.lines.iter().map(layout::line_text).collect::<String>())
+            .unwrap_or_default();
+        assert!(text.contains("landed"), "{text}");
+        assert!(!app.tabs[0].loading);
+    }
+
+    #[test]
+    fn fragment_link_scrolls_without_a_fetch() {
+        let blocker = crate::block::Blocker::from_rules("");
+        let mut app = blank();
+        app.finish(
+            0,
+            0,
+            Ok(crate::load::Fetched {
+                final_url: "https://example.com/page".into(),
+                html: "<p>top</p><h2 id=\"b\">Bottom</h2><p><a href=\"#b\">go</a></p>".into(),
+            }),
+            &blocker,
+        );
+        for _ in 0..10 {
+            if app.status_line(false).contains("Enter follow") {
+                break;
+            }
+            app.on_key(key('j'));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.jobs.is_empty());
+        let cursor = app.tabs[0].cursor as usize;
+        let line = layout::line_text(&app.tabs[0].document().unwrap().lines[cursor]);
+        assert!(line.contains("Bottom"), "{line}");
+    }
+
+    #[test]
+    fn reload_repeats_a_post() {
+        let blocker = crate::block::Blocker::from_rules("");
+        let mut app = blank();
+        app.finish(
+            0,
+            0,
+            Ok(crate::load::Fetched {
+                final_url: "https://example.com/".into(),
+                html: "<form method=\"post\" action=\"/login\"><input name=\"user\" value=\"a\"><input type=\"submit\" value=\"go\"></form>".into(),
+            }),
+            &blocker,
+        );
+        if app.status_line(false).contains("Enter edit") {
+            app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        }
+        if !app.status_line(false).contains("Enter submit") {
+            app.on_key(key('j'));
+        }
+        assert!(app.status_line(false).contains("Enter submit"));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.jobs.clear();
+        app.on_key(key('r'));
+        assert!(app.jobs[0].post);
+        assert!(app.jobs[0].body.as_deref().unwrap_or("").contains("user=a"));
+    }
+
+    #[test]
+    fn a_redirected_post_reloads_as_get() {
+        let blocker = crate::block::Blocker::from_rules("");
+        let mut app = blank();
+        app.tabs[0].history[0].url = "https://example.com/login".into();
+        app.tabs[0].history[0].post = true;
+        app.tabs[0].history[0].body = Some("user=a".into());
+        app.finish(
+            0,
+            0,
+            Ok(crate::load::Fetched {
+                final_url: "https://example.com/home".into(),
+                html: "<p>hi</p>".into(),
+            }),
+            &blocker,
+        );
+        app.on_key(key('r'));
+        assert_eq!(app.jobs[0].url, "https://example.com/home");
+        assert!(!app.jobs[0].post);
+    }
+
+    #[test]
+    fn ttl_reports_a_failed_save() {
+        let mut app = blank();
+        app.config_path = std::path::PathBuf::from("/proc/holonet-not-a-directory/config");
+        app.on_key(key(':'));
+        for ch in "ttl 5".chars() {
+            app.on_key(key(ch));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.message.contains("could not save"), "{}", app.message);
+        assert_eq!(app.ttl_minutes, 0);
+    }
+
+    #[test]
+    fn help_list_scrolls() {
+        let mut app = blank();
+        app.on_key(key('?'));
+        app.on_key(key('j'));
+        assert_eq!(app.overlay_scroll, 1);
+        app.on_key(key('k'));
+        assert_eq!(app.overlay_scroll, 0);
+    }
+
+    #[test]
+    fn a_long_edit_stays_within_the_line() {
+        let blocker = crate::block::Blocker::from_rules("");
+        let mut app = blank();
+        app.finish(
+            0,
+            0,
+            Ok(crate::load::Fetched {
+                final_url: "https://example.com/".into(),
+                html: "<form><input name=\"q\"></form>".into(),
+            }),
+            &blocker,
+        );
+        assert!(app.status_line(false).contains("Enter edit"));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.paste(&"x".repeat(200));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let text = app.tabs[0]
+            .document()
+            .map(|doc| doc.lines.iter().map(layout::line_text).collect::<String>())
+            .unwrap_or_default();
+        assert!(text.contains('x'), "{text}");
+        assert!(!text.contains(&"x".repeat(80)), "{text}");
     }
 }

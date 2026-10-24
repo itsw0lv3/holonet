@@ -30,7 +30,7 @@ pub fn draw(frame: &mut Frame, app: &App, blocker: &Blocker) {
     frame.render_widget(Paragraph::new(app.url_line()), url);
 
     if let Some(overlay) = app.overlay {
-        let lines = match overlay {
+        let mut lines = match overlay {
             Overlay::Help => help_lines()
                 .iter()
                 .map(|line| Line::from(*line))
@@ -48,6 +48,10 @@ pub fn draw(frame: &mut Frame, app: &App, blocker: &Blocker) {
                 })
                 .collect(),
         };
+        let rows = page.height as usize;
+        let max = lines.len().saturating_sub(rows.max(1));
+        let start = (app.overlay_scroll as usize).min(max);
+        lines.drain(..start);
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), page);
     } else {
         let mut lines = Vec::new();
@@ -100,7 +104,7 @@ mod tests {
     #[test]
     fn blank_ui_draws_the_chrome() {
         let blocker = Blocker::from_rules("");
-        let app = App::new(80, std::env::temp_dir().join("tbw-draw-absent"));
+        let app = App::new(80, std::env::temp_dir().join("holonet-draw-absent"));
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|frame| draw(frame, &app, &blocker)).unwrap();
         let text: String = terminal
@@ -117,14 +121,13 @@ mod tests {
     #[test]
     fn focused_link_draws_a_cursor() {
         let blocker = Blocker::from_rules("");
-        let mut app = App::new(80, std::env::temp_dir().join("tbw-draw-absent"));
+        let mut app = App::new(80, std::env::temp_dir().join("holonet-draw-absent"));
         app.finish(
             0,
             0,
             Ok(crate::load::Fetched {
                 final_url: "https://example.com/".into(),
                 html: "<p><a href=\"/next\">next</a></p>".into(),
-                blocked: 0,
             }),
             &blocker,
         );

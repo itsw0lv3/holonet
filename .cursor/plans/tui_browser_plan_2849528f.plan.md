@@ -3,7 +3,7 @@ name: TUI browser plan
 overview: "Build a Rust text-mode terminal browser: ratatui chrome, tabs, HTML layout, and Brave’s adblock-rust engine. Pages come from a Loader so a later Chromium snapshot can fill client-rendered pages without replacing the TUI. Kitty images stay a layout slot."
 todos:
   - id: scaffold
-    content: Scaffold the tbw crate, module layout, and Loader trait. A blank UI quits on q.
+    content: Scaffold the holonet crate, module layout, and Loader trait. A blank UI quits on q.
     status: completed
   - id: http-loader
     content: "HttpLoader: rustls GET, charset decode, manual redirects. Returns the final URL and HTML."
@@ -34,7 +34,7 @@ isProject: false
 
 # TUI text browser
 
-Empty repo at `/home/w0lv3/Projects/personal/tbw`. Ship a keyboard-driven text browser named `tbw`. It fetches real pages, lays out readable HTML, and runs [Brave’s `adblock` crate](https://github.com/brave/adblock-rust) (MPL-2.0) in-process. No JavaScript engine and no pixel framebuffer. Client-rendered sites stay blank; that is an accepted limit, not a bug to paper over.
+Empty repo at `/home/w0lv3/Projects/personal/holonet`. Ship a keyboard-driven text browser named `holonet`. It fetches real pages, lays out readable HTML, and runs [Brave’s `adblock` crate](https://github.com/brave/adblock-rust) (MPL-2.0) in-process. No JavaScript engine and no pixel framebuffer. Client-rendered sites stay blank; that is an accepted limit, not a bug to paper over.
 
 Closest prior art, used as a map only (do not vendor their code): [glyph](https://github.com/k1y0miiii/glyph) (Rust, ratatui, no JS, no adblock) and [Chawan](https://chawan.net/) (full small engine, Nim, years of work). Carbonyl-style Chromium-in-a-terminal is out of scope.
 
@@ -133,7 +133,7 @@ Mouse: click a tab or a link if it falls out of the keyboard path cheaply. Do no
 
 Build these in order. Chromium, Kitty, and bookmarks are not in this list.
 
-1. **Scaffold.** One crate, binary `tbw`, modules `ui`, `tabs`, `load`, `block`, `dom`, `layout`. `Loader` returns the final URL and an HTML body. `block` is an empty pass. Done when the process draws a blank terminal UI and `q` quits.
+1. **Scaffold.** One crate, binary `holonet`, modules `ui`, `tabs`, `load`, `block`, `dom`, `layout`. `Loader` returns the final URL and an HTML body. `block` is an empty pass. Done when the process draws a blank terminal UI and `q` quits.
 2. **HttpLoader.** `reqwest` with rustls. Decode with `encoding_rs`. Follow redirects in our code, with a hop cap. Done when a load returns the HTML and the URL after redirects.
 3. **Layout.** `scraper` parse. Drop `script`, `style`, `noscript`, `iframe`, and `svg`. Lay out headings, paragraphs, lists, links, preformatted text, and simple tables. Images are an alt-text placeholder. Fixture tests cover headings, links, and wrapping.
 4. **Browse one page.** Viewport scroll, move between links, Enter follows, back, `r` reload, `o` opens a URL. A layout with no text says so on the status line. Check `example.org`, a Wikipedia article, and Rust docs by hand.

@@ -202,17 +202,16 @@ impl Blocker {
         self.lock().updating
     }
 
-    pub fn set_updating(&self, updating: bool) {
-        self.lock().updating = updating;
-    }
-
     /// Download the Brave lists, compile them, and replace the engine.
     /// A list that fails to download is skipped. The previous engine stays if nothing downloads.
     pub async fn update(&self, client: &reqwest::Client) -> Result<(), String> {
-        if self.is_updating() {
-            return Ok(());
+        {
+            let mut guard = self.lock();
+            if guard.updating {
+                return Ok(());
+            }
+            guard.updating = true;
         }
-        self.set_updating(true);
         let dir = self.dir.clone();
         let result = download_and_compile(client, &dir).await;
         match result {
@@ -224,7 +223,7 @@ impl Blocker {
                 Ok(())
             }
             Err(err) => {
-                self.set_updating(false);
+                self.lock().updating = false;
                 Err(err)
             }
         }
@@ -430,7 +429,7 @@ mod tests {
 
     #[test]
     fn cached_engine_and_list_titles_load() {
-        let dir = std::env::temp_dir().join(format!("tbw-cache-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("holonet-cache-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let engine = compile(&["||evil.test^\n".into()]);

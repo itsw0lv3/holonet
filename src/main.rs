@@ -20,7 +20,7 @@ use crate::tabs::App;
 
 enum Msg {
     Page {
-        tab: usize,
+        tab_id: u64,
         generation: u64,
         result: std::result::Result<load::Fetched, String>,
     },
@@ -44,7 +44,7 @@ async fn main() -> Result<()> {
     let mut terminal = ratatui::try_init()?;
     let size = terminal.size()?;
     app.set_viewport(
-        size.width as usize,
+        text_cols(size.width),
         size.height.saturating_sub(3) as usize,
         &blocker,
     );
@@ -58,7 +58,7 @@ async fn main() -> Result<()> {
     loop {
         let size = terminal.size()?;
         app.set_viewport(
-            size.width as usize,
+            text_cols(size.width),
             size.height.saturating_sub(3) as usize,
             &blocker,
         );
@@ -74,7 +74,11 @@ async fn main() -> Result<()> {
                     Some(Ok(Event::Key(key))) => app.on_key(key),
                     Some(Ok(Event::Paste(text))) => app.paste(&text),
                     Some(Ok(Event::Resize(width, height))) => {
-                        app.set_viewport(width as usize, height.saturating_sub(3) as usize, &blocker);
+                        app.set_viewport(
+                            text_cols(width),
+                            height.saturating_sub(3) as usize,
+                            &blocker,
+                        );
                     }
                     Some(Err(err)) => {
                         drop(restore);
@@ -86,7 +90,9 @@ async fn main() -> Result<()> {
             }
             msg = rx.recv() => {
                 match msg {
-                    Some(Msg::Page { tab, generation, result }) => app.finish(tab, generation, result, &blocker),
+                    Some(Msg::Page { tab_id, generation, result }) => {
+                        app.finish(tab_id, generation, result, &blocker)
+                    }
                     Some(Msg::Filters(Ok(()))) => app.message.clear(),
                     Some(Msg::Filters(Err(err))) => app.message = err,
                     None => break,
@@ -129,7 +135,7 @@ fn spawn_jobs(
             .await;
             let _ = tx
                 .send(Msg::Page {
-                    tab: job.tab,
+                    tab_id: job.tab_id,
                     generation: job.generation,
                     result,
                 })
@@ -145,14 +151,19 @@ fn spawn_update(blocker: Arc<Blocker>, http: reqwest::Client, tx: mpsc::Sender<M
     });
 }
 
+// shortcut: hint letters still draw past these two columns, upgrade if a dense hint line clips
+fn text_cols(width: u16) -> usize {
+    (width as usize).saturating_sub(2).max(1)
+}
+
 fn dirs() -> (std::path::PathBuf, std::path::PathBuf) {
-    if let Some(dirs) = ProjectDirs::from("dev", "tbw", "tbw") {
+    if let Some(dirs) = ProjectDirs::from("dev", "holonet", "holonet") {
         (
             dirs.config_dir().to_path_buf(),
             dirs.data_dir().to_path_buf(),
         )
     } else {
-        let dir = std::env::temp_dir().join("tbw");
+        let dir = std::env::temp_dir().join("holonet");
         (dir.clone(), dir)
     }
 }
