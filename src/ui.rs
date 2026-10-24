@@ -6,7 +6,7 @@ use ratatui::widgets::{Paragraph, Tabs, Wrap};
 
 use crate::block::Blocker;
 use crate::layout::StyleKind;
-use crate::tabs::App;
+use crate::tabs::{App, Overlay, help_lines};
 
 pub fn draw(frame: &mut Frame, app: &App, blocker: &Blocker) {
     let area = frame.area();
@@ -29,19 +29,25 @@ pub fn draw(frame: &mut Frame, app: &App, blocker: &Blocker) {
     );
     frame.render_widget(Paragraph::new(app.url_line()), url);
 
-    if app.overlay {
-        let lines: Vec<Line> = blocker
-            .lists()
-            .iter()
-            .map(|list| {
-                let state = list
-                    .error
-                    .clone()
-                    .or(list.updated.clone())
-                    .unwrap_or_else(|| "not downloaded".into());
-                Line::from(format!("{}  {state}", list.title))
-            })
-            .collect();
+    if let Some(overlay) = app.overlay {
+        let lines = match overlay {
+            Overlay::Help => help_lines()
+                .iter()
+                .map(|line| Line::from(*line))
+                .collect::<Vec<_>>(),
+            Overlay::Lists => blocker
+                .lists()
+                .iter()
+                .map(|list| {
+                    let state = list
+                        .error
+                        .clone()
+                        .or(list.updated.clone())
+                        .unwrap_or_else(|| "not downloaded".into());
+                    Line::from(format!("{}  {state}", list.title))
+                })
+                .collect(),
+        };
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), page);
     } else {
         let mut lines = Vec::new();

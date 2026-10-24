@@ -69,7 +69,7 @@ pub struct App {
     config_path: PathBuf,
     pub jobs: Vec<Job>,
     pub update: bool,
-    pub overlay: bool,
+    pub overlay: Option<Overlay>,
 }
 
 impl App {
@@ -90,7 +90,7 @@ impl App {
             config_path,
             jobs: Vec::new(),
             update: false,
-            overlay: false,
+            overlay: None,
         }
     }
 
@@ -214,12 +214,12 @@ impl App {
             self.quit = true;
             return;
         }
-        if self.overlay {
+        if self.overlay.is_some() {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
                 if key.code == KeyCode::Char('q') {
                     self.quit = true;
                 }
-                self.overlay = false;
+                self.overlay = None;
             }
             return;
         }
@@ -405,6 +405,7 @@ impl App {
     fn normal_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('?') => self.overlay = Some(Overlay::Help),
             KeyCode::Char('o') => self.mode = Mode::Open(String::new()),
             KeyCode::Char(':') => self.mode = Mode::Command(String::new()),
             KeyCode::Char('/') => self.mode = Mode::Find(self.find_query.clone()),
@@ -511,7 +512,8 @@ impl App {
                     self.message = format!("tab_ttl={}", self.ttl_minutes);
                 }
             }
-            "lists" => self.overlay = true,
+            "help" => self.overlay = Some(Overlay::Help),
+            "lists" => self.overlay = Some(Overlay::Lists),
             "update" => self.update = true,
             "js" => self.message = "javascript rendering is not built".into(),
             other => self.message = format!("unknown command {other}"),
@@ -911,6 +913,38 @@ impl Prompt {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Overlay {
+    Help,
+    Lists,
+}
+
+pub fn help_lines() -> &'static [&'static str] {
+    &[
+        "j k          move the line cursor",
+        "PgUp PgDn    page",
+        "g G          top and bottom",
+        "Enter        open the link on this line",
+        "T            open that link in a new tab",
+        "Tab          other link on this line",
+        "o            open a url or search",
+        "/ n N        find",
+        "t W          new tab, close tab",
+        "] [  1-9     switch tab, jump to a tab",
+        "b            back",
+        "r            reload",
+        "f F          hint, hint in a new tab",
+        ":help        this list",
+        ":lists       filter lists",
+        ":update      download filter lists",
+        ":unload      drop this tab's page",
+        ":unloadothers",
+        ":ttl N       unload background tabs after N minutes (0 off)",
+        "q            quit",
+        "Esc          close this",
+    ]
+}
+
 pub struct ViewportLine {
     pub pieces: Vec<DrawnPiece>,
     pub current_match: bool,
@@ -1222,6 +1256,24 @@ mod tests {
             app.on_key(key(ch));
         }
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(app.overlay);
+        assert_eq!(app.overlay, Some(Overlay::Lists));
+    }
+
+    #[test]
+    fn help_command_lists_the_keys() {
+        let mut app = blank();
+        app.on_key(key('?'));
+        assert_eq!(app.overlay, Some(Overlay::Help));
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.overlay, None);
+        app.on_key(key(':'));
+        for ch in "help".chars() {
+            app.on_key(key(ch));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.overlay, Some(Overlay::Help));
+        let text = help_lines().join("\n");
+        assert!(text.contains("Enter"));
+        assert!(text.contains(":help"));
     }
 }
