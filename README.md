@@ -12,7 +12,7 @@ The first cut is done. One process, one crate. Modules: `ui`, `tabs`, `load`, `b
 | --- | --- |
 | Load | rustls GET and POST, charset decode, manual redirects (10 hops), in-memory cookie jar |
 | Layout | Headings, paragraphs, lists, links, pre, simple tables, form fields. Images are alt text |
-| Browse | Scroll, focus, follow, back, reload, open a URL or search, find-in-page, link hints |
+| Browse | Scroll, focus, follow, back, reload, open a URL or search, find-in-page, link hints, mouse click/wheel |
 | Tabs | Per-tab history and scroll. New, close, switch. Session is memory only |
 | Unload | `:unload`, `:unloadothers`, `:ttl`. Focusing an unloaded tab reloads its URL |
 | Adblock | Network checks on the document and each redirect. Cosmetic hide rules. `.dat` cache |
@@ -22,7 +22,8 @@ The first cut is done. One process, one crate. Modules: `ui`, `tabs`, `load`, `b
 Accepted limits of this cut:
 
 - Client-rendered sites stay blank.
-- No forward history, bookmarks, mouse, password store, or author CSS.
+- No forward history, bookmarks, password store, or author CSS.
+- Mouse click follows a link and the wheel scrolls when the terminal reports mouse events. Capture usually disables selecting text in the terminal.
 - Cosmetic rules that `scraper` cannot parse are skipped. Scriptlets, procedural filters (`:has-text`, `:upward`), and `$redirect` replacements are not applied. Those need a JS engine.
 - The cookie jar is not written to disk. Form text is not a password store.
 - Background tabs unload within about 30 seconds of their ttl, not on the exact minute.
@@ -60,6 +61,8 @@ The first start with no cache downloads the filter lists and compiles them off t
 | `g` `G` | Top and bottom |
 | `Tab` / `Shift+Tab` | Next or previous focus on the cursor line |
 | `Enter` | Follow, edit a field, or submit |
+| click | Follow the link under the pointer |
+| wheel | Scroll the page |
 | `Shift+Enter` or `T` | Open the focused link in a new tab |
 | `o` | Open a URL or search. `Esc` cancels, `Enter` goes |
 | `/` `n` `N` | Find, next, previous |
