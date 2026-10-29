@@ -2,7 +2,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use unicode_width::UnicodeWidthStr;
 
 use crate::block::Blocker;
 use crate::dom;
@@ -256,6 +259,69 @@ impl App {
         }
     }
 
+    pub fn on_mouse(&mut self, mouse: MouseEvent) {
+        if self.overlay.is_some() {
+            match mouse.kind {
+                MouseEventKind::ScrollDown => {
+                    self.overlay_scroll = self.overlay_scroll.saturating_add(1);
+                }
+                MouseEventKind::ScrollUp => {
+                    self.overlay_scroll = self.overlay_scroll.saturating_sub(1);
+                }
+                _ => {}
+            }
+            return;
+        }
+        if !matches!(self.mode, Mode::Normal) {
+            return;
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollDown => self.move_cursor(1),
+            MouseEventKind::ScrollUp => self.move_cursor(-1),
+            MouseEventKind::Down(MouseButton::Left) => self.click_at(mouse.column, mouse.row),
+            _ => {}
+        }
+    }
+
+    // shortcut: chrome is fixed at 2 header rows + 1 status; upgrade if the layout gains another band
+    fn click_at(&mut self, column: u16, row: u16) {
+        if row < 2 {
+            return;
+        }
+        let page_row = (row - 2) as usize;
+        if page_row >= self.view_rows {
+            return;
+        }
+        let lines = self.viewport_lines();
+        let Some(line) = lines.get(page_row) else {
+            return;
+        };
+        let mut col = column as usize;
+        if line.cursor {
+            if col < 2 {
+                return;
+            }
+            col -= 2;
+        }
+        let mut x = 0usize;
+        for piece in &line.pieces {
+            let width = piece.text.width();
+            if col < x + width {
+                if let Some(focus) = piece.focus
+                    && self.tabs[self.current]
+                        .document()
+                        .and_then(|doc| doc.focus.get(focus))
+                        .is_some_and(|item| matches!(item, Focus::Link { .. }))
+                {
+                    self.tabs[self.current].focus = Some(focus);
+                    self.activate(false);
+                }
+                return;
+            }
+            x += width;
+        }
+    }
+
     pub fn paste(&mut self, text: &str) {
         let extra = text
             .chars()
@@ -421,6 +487,7 @@ impl App {
                             DrawnPiece {
                                 text: piece.text.clone(),
                                 style: piece.style,
+                                focus: piece.focus,
                                 hint: show.then_some(hint).flatten(),
                             }
                         })
@@ -1081,6 +1148,8 @@ pub fn help_lines() -> &'static [&'static str] {
         "Enter        open the link on this line",
         "T            open that link in a new tab",
         "Tab          other link on this line",
+        "click        follow a link (when the terminal sends mouse)",
+        "wheel        scroll the page",
         "o            open a url or search",
         "/ n N        find",
         "t W          new tab, close tab",
@@ -1109,6 +1178,7 @@ pub struct ViewportLine {
 pub struct DrawnPiece {
     pub text: String,
     pub style: layout::StyleKind,
+    pub focus: Option<usize>,
     pub hint: Option<char>,
 }
 
@@ -1205,6 +1275,30 @@ mod tests {
         app.on_key(key('T'));
         assert_eq!(app.tab_count(), 2);
         assert_eq!(app.current(), 1);
+        assert_eq!(app.jobs.last().unwrap().url, "https://example.com/next");
+    }
+
+    #[test]
+    fn click_follows_the_link_under_the_pointer() {
+        let blocker = crate::block::Blocker::from_rules("");
+        let mut app = blank();
+        app.set_viewport(40, 20, &blocker);
+        app.finish(
+            0,
+            0,
+            Ok(crate::load::Fetched {
+                final_url: "https://example.com/".into(),
+                html: "<p>Hi <a href=\"/next\">next</a> there</p>".into(),
+            }),
+            &blocker,
+        );
+        // page starts at row 2; cursor line draws "> " then "Hi " (width 3) then "next"
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2 + 3 + 1,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
         assert_eq!(app.jobs.last().unwrap().url, "https://example.com/next");
     }
 

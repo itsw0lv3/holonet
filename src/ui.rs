@@ -1,6 +1,6 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Tabs, Wrap};
 
@@ -71,9 +71,16 @@ pub fn draw(frame: &mut Frame, app: &App, blocker: &Blocker) {
                     ));
                 }
                 let mut style = match piece.style {
+                    StyleKind::Title => Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
                     StyleKind::Heading => Style::default().add_modifier(Modifier::BOLD),
-                    StyleKind::Link => Style::default().add_modifier(Modifier::UNDERLINED),
-                    StyleKind::Code => Style::default().add_modifier(Modifier::DIM),
+                    StyleKind::Link => Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::UNDERLINED),
+                    StyleKind::Code | StyleKind::Muted => {
+                        Style::default().add_modifier(Modifier::DIM)
+                    }
                     StyleKind::Text => Style::default(),
                 };
                 if line.cursor || line.current_match {

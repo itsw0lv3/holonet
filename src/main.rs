@@ -9,7 +9,10 @@ use std::io::Result;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossterm::event::{Event, EventStream};
+use std::io::{self, Write};
+
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream};
+use crossterm::execute;
 use directories::ProjectDirs;
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
@@ -42,6 +45,7 @@ async fn main() -> Result<()> {
     }
 
     let mut terminal = ratatui::try_init()?;
+    execute!(io::stdout(), EnableMouseCapture)?;
     let size = terminal.size()?;
     app.set_viewport(
         text_cols(size.width),
@@ -72,6 +76,7 @@ async fn main() -> Result<()> {
             event = events.next() => {
                 match event {
                     Some(Ok(Event::Key(key))) => app.on_key(key),
+                    Some(Ok(Event::Mouse(mouse))) => app.on_mouse(mouse),
                     Some(Ok(Event::Paste(text))) => app.paste(&text),
                     Some(Ok(Event::Resize(width, height))) => {
                         app.set_viewport(
@@ -172,6 +177,8 @@ struct Restore;
 
 impl Drop for Restore {
     fn drop(&mut self) {
+        let _ = execute!(io::stdout(), DisableMouseCapture);
+        let _ = io::stdout().flush();
         ratatui::restore();
     }
 }

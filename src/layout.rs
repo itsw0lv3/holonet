@@ -10,9 +10,11 @@ use url::Url;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StyleKind {
     Text,
+    Title,
     Heading,
     Link,
     Code,
+    Muted,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -96,8 +98,10 @@ pub fn layout(
         hidden,
         hidden_count: 0,
         link_focus: None,
-        heading: false,
+        heading: 0,
+        muted: 0,
         code: 0,
+        list_depth: 0,
         current_form: None,
         ol: Vec::new(),
         pending_ids: Vec::new(),
@@ -181,8 +185,10 @@ struct Ctx<'a> {
     hidden: &'a HashSet<NodeId>,
     hidden_count: u32,
     link_focus: Option<usize>,
-    heading: bool,
+    heading: u8,
+    muted: u32,
     code: u32,
+    list_depth: usize,
     current_form: Option<usize>,
     ol: Vec<u32>,
     pending_ids: Vec<String>,
@@ -228,11 +234,18 @@ impl Ctx<'_> {
                 self.pre -= 1;
                 self.break_block();
             }
-            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+            "h1" => {
                 self.break_block();
-                self.heading = true;
+                self.heading = 1;
                 self.walk_children(el);
-                self.heading = false;
+                self.heading = 0;
+                self.break_block();
+            }
+            "h2" | "h3" | "h4" | "h5" | "h6" => {
+                self.break_block();
+                self.heading = 2;
+                self.walk_children(el);
+                self.heading = 0;
                 self.break_block();
             }
             "a" => self.walk_link(el),
@@ -245,9 +258,17 @@ impl Ctx<'_> {
             "select" => self.walk_select(el),
             "ol" => {
                 self.ol.push(0);
+                self.list_depth += 1;
                 self.break_block();
                 self.walk_children(el);
+                self.list_depth -= 1;
                 self.ol.pop();
+            }
+            "ul" => {
+                self.list_depth += 1;
+                self.break_block();
+                self.walk_children(el);
+                self.list_depth -= 1;
             }
             "li" => self.walk_li(el),
             "code" | "kbd" => {
@@ -255,9 +276,21 @@ impl Ctx<'_> {
                 self.walk_children(el);
                 self.code -= 1;
             }
-            "p" | "div" | "section" | "article" | "header" | "footer" | "main" | "nav"
-            | "blockquote" | "ul" | "dl" | "dt" | "dd" | "figure" | "figcaption" | "address"
-            | "aside" | "hgroup" => {
+            "blockquote" => {
+                self.break_block();
+                self.push_text("| ", StyleKind::Muted, None);
+                self.walk_children(el);
+                self.break_block();
+            }
+            "nav" | "aside" => {
+                self.break_block();
+                self.muted += 1;
+                self.walk_children(el);
+                self.muted -= 1;
+                self.break_block();
+            }
+            "p" | "div" | "section" | "article" | "header" | "footer" | "main" | "dl" | "dt"
+            | "dd" | "figure" | "figcaption" | "address" | "hgroup" => {
                 self.break_block();
                 self.walk_children(el);
                 self.break_block();
@@ -317,45 +350,38 @@ impl Ctx<'_> {
 
     fn walk_table(&mut self, el: ElementRef) {
         self.break_block();
-        for child in el.children() {
-            let Some(child) = ElementRef::wrap(child) else {
-                continue;
-            };
-            match child.value().name() {
-                "tr" => self.walk_row(child),
-                "thead" | "tbody" | "tfoot" => {
-                    for row in child.children() {
-                        if let Some(row) = ElementRef::wrap(row)
-                            && row.value().name() == "tr"
-                        {
-                            self.walk_row(row);
-                        }
-                    }
+        let rows = table_rows(el);
+        let mut widths = Vec::new();
+        for row in &rows {
+            for (index, cell) in row.iter().enumerate() {
+                let width = cell_plain_width(cell);
+                if widths.len() <= index {
+                    widths.resize(index + 1, 0);
                 }
-                _ => {}
+                widths[index] = widths[index].max(width);
             }
         }
-        self.break_block();
-    }
-
-    fn walk_row(&mut self, el: ElementRef) {
-        self.break_block();
-        let mut first = true;
-        for child in el.children() {
-            let Some(child) = ElementRef::wrap(child) else {
-                continue;
-            };
-            if !matches!(child.value().name(), "td" | "th") {
-                continue;
+        for row in rows {
+            self.break_block();
+            let mut first = true;
+            for (index, cell) in row.iter().enumerate() {
+                if !first {
+                    self.push_text(" | ", StyleKind::Text, None);
+                }
+                first = false;
+                let before = self.col;
+                let was = self.in_cell;
+                self.in_cell = true;
+                self.walk_children(*cell);
+                self.in_cell = was;
+                // shortcut: padding assumes the cell stayed on one line, upgrade if wrapped cells must align
+                let used = self.col.saturating_sub(before);
+                let pad = widths.get(index).copied().unwrap_or(0).saturating_sub(used);
+                if pad > 0 {
+                    self.push_text(&" ".repeat(pad), StyleKind::Text, None);
+                }
             }
-            if !first {
-                self.push_text(" | ", StyleKind::Text, None);
-            }
-            first = false;
-            let was = self.in_cell;
-            self.in_cell = true;
-            self.walk_children(child);
-            self.in_cell = was;
+            self.break_block();
         }
         self.break_block();
     }
@@ -497,11 +523,12 @@ impl Ctx<'_> {
 
     fn walk_li(&mut self, el: ElementRef) {
         self.break_block();
+        let indent = "  ".repeat(self.list_depth.saturating_sub(1));
         let prefix = if let Some(n) = self.ol.last_mut() {
             *n += 1;
-            format!("{n}. ")
+            format!("{indent}{n}. ")
         } else {
-            "- ".into()
+            format!("{indent}- ")
         };
         self.push_text(&prefix, StyleKind::Text, None);
         self.walk_children(el);
@@ -544,10 +571,14 @@ impl Ctx<'_> {
     fn style(&self) -> StyleKind {
         if self.link_focus.is_some() {
             StyleKind::Link
-        } else if self.heading {
+        } else if self.heading == 1 {
+            StyleKind::Title
+        } else if self.heading > 0 {
             StyleKind::Heading
         } else if self.code > 0 {
             StyleKind::Code
+        } else if self.muted > 0 {
+            StyleKind::Muted
         } else {
             StyleKind::Text
         }
@@ -699,6 +730,45 @@ impl Ctx<'_> {
     }
 }
 
+fn table_rows(el: ElementRef<'_>) -> Vec<Vec<ElementRef<'_>>> {
+    let mut rows = Vec::new();
+    for child in el.children() {
+        let Some(child) = ElementRef::wrap(child) else {
+            continue;
+        };
+        match child.value().name() {
+            "tr" => rows.push(table_cells(child)),
+            "thead" | "tbody" | "tfoot" => {
+                for row in child.children() {
+                    if let Some(row) = ElementRef::wrap(row)
+                        && row.value().name() == "tr"
+                    {
+                        rows.push(table_cells(row));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    rows
+}
+
+fn table_cells(el: ElementRef<'_>) -> Vec<ElementRef<'_>> {
+    el.children()
+        .filter_map(ElementRef::wrap)
+        .filter(|child| matches!(child.value().name(), "td" | "th"))
+        .collect()
+}
+
+fn cell_plain_width(el: &ElementRef<'_>) -> usize {
+    el.text()
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .width()
+}
+
 fn collapse_ws(text: &str) -> String {
     let mut out = String::new();
     let mut pending = false;
@@ -753,7 +823,7 @@ mod tests {
         assert!(document.lines.iter().any(|line| {
             line.spans
                 .iter()
-                .any(|piece| piece.text.contains("Hello") && piece.style == StyleKind::Heading)
+                .any(|piece| piece.text.contains("Hello") && piece.style == StyleKind::Title)
         }));
         match &document.focus[0] {
             Focus::Link { url } => assert_eq!(url, "https://example.com/x"),
@@ -796,7 +866,7 @@ mod tests {
     #[test]
     fn table_list_and_pre() {
         let document = doc(
-            "<ul><li>one</li></ul><table><tr><td>A</td><td>B</td></tr></table><pre>a  b</pre>",
+            "<ul><li>one</li><li><ul><li>nested</li></ul></li></ul><table><tr><td>A</td><td>BB</td></tr><tr><td>CCC</td><td>D</td></tr></table><pre>a  b</pre><blockquote>said</blockquote><nav>skip</nav>",
             40,
         );
         let lines: Vec<String> = document.lines.iter().map(line_text).collect();
@@ -805,12 +875,27 @@ mod tests {
             "{lines:?}"
         );
         assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("A") && line.contains("B")),
+            lines.iter().any(|line| line.starts_with("  - nested")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("A  | BB")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("CCC | D ")),
             "{lines:?}"
         );
         assert!(lines.iter().any(|line| line.contains("a  b")), "{lines:?}");
+        assert!(
+            lines.iter().any(|line| line.starts_with("| said")),
+            "{lines:?}"
+        );
+        assert!(document.lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .any(|piece| piece.text.contains("skip") && piece.style == StyleKind::Muted)
+        }));
     }
 
     #[test]
