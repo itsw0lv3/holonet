@@ -4,6 +4,9 @@ A keyboard-driven text browser. It fetches pages over HTTPS, lays out readable H
 
 The binary is `holonet`.
 
+## Why?
+I have been using a few terminal base web browsers and none of them really have all the features I have wanted to this is my attempt to try and develop one that I would be happy to use daily.
+
 ## Status
 
 The first cut is done. One process, one crate. Modules: `ui`, `tabs`, `load`, `block`, `dom`, `layout`.
